@@ -1,90 +1,91 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""注意力增强MLP模型"""
-import numpy as np
 import torch
 import torch.nn as nn
+import numpy as np
 
-class AttentionEnhancedMLP(nn.Module):
-    """注意力增强的MLP：融合傅里叶/时域特征预测DE4/DE1比值"""
-    def __init__(self, input_dim, fourier_dim=5, temporal_dim=10, 
-                 hidden_dims=[256, 128, 64], num_heads=4, dropout_rate=0.2):
+class TransformerRegressionModel(nn.Module):
+
+    def __init__(
+        self,
+        time_dim,
+        fourier_dim,
+        temporal_dim,
+        d_model=128,
+        n_heads=4,
+        num_layers=3,
+        dropout=0.1
+    ):
         super().__init__()
-        self.input_dim = input_dim
-        self.fourier_dim = fourier_dim
-        self.temporal_dim = temporal_dim
-        self.total_feature_dim = input_dim + fourier_dim + temporal_dim
 
-        # 特征投影层
-        self.feature_projection = nn.Sequential(
-            nn.Linear(self.total_feature_dim, hidden_dims[0]),
+        self.d_model = d_model
+
+        # 1. Token embedding
+        self.time_embedding = nn.Linear(time_dim, d_model)
+        self.fourier_embedding = nn.Linear(fourier_dim, d_model)
+        self.temporal_embedding = nn.Linear(temporal_dim, d_model)
+
+        # 2. Positional encoding
+        self.pos_embedding = nn.Parameter(
+            torch.zeros(1, 3, d_model)
+        )
+
+        # 3. Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        # 4. Regression head
+        self.regressor = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.LayerNorm(hidden_dims[0])
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1)
         )
 
-        # 多头注意力
-        self.attention = nn.MultiheadAttention(
-            embed_dim=hidden_dims[0], num_heads=num_heads, dropout=dropout_rate, batch_first=True
-        )
-
-        # 注意力后投影
-        self.attention_projection = nn.Sequential(
-            nn.Linear(hidden_dims[0], hidden_dims[1]),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.LayerNorm(hidden_dims[1])
-        )
-
-        # MLP预测头
-        mlp_layers = []
-        mlp_input_dims = [hidden_dims[1]] + hidden_dims[2:] if len(hidden_dims)>=2 else [hidden_dims[0]]
-        for i in range(len(mlp_input_dims)-1):
-            mlp_layers.extend([
-                nn.Linear(mlp_input_dims[i], mlp_input_dims[i+1]),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.LayerNorm(mlp_input_dims[i+1])
-            ])
-        mlp_layers.append(nn.Linear(mlp_input_dims[-1], 1))
-        self.mlp = nn.Sequential(*mlp_layers)
-
-        # 残差连接投影
-        self.residual_projection = nn.Linear(self.total_feature_dim, hidden_dims[1]) if self.total_feature_dim != hidden_dims[1] else nn.Identity()
-
-        # 权重初始化
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier初始化线性层，LayerNorm初始化"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
 
     def forward(self, x_time, x_fourier, x_temporal):
-        """前向传播：输入→特征拼接→投影→注意力→残差→预测"""
-        combined = torch.cat([x_time, x_fourier, x_temporal], dim=1)  # [B, total_dim]
-        projected = self.feature_projection(combined)                # [B, h0]
-        attn_out, _ = self.attention(projected.unsqueeze(1), projected.unsqueeze(1), projected.unsqueeze(1))
-        attn_out = attn_out.squeeze(1)                               # [B, h0]
-        attn_proj = self.attention_projection(attn_out)              # [B, h1]
-        residual = self.residual_projection(combined)                # [B, h1]
-        output = self.mlp(attn_proj + residual)                      # [B, 1]
+        """
+        x_*: [batch_size, feature_dim]
+        """
+
+        # 1. Embedding → [B, 1, D]
+        t = self.time_embedding(x_time).unsqueeze(1)
+        f = self.fourier_embedding(x_fourier).unsqueeze(1)
+        temp = self.temporal_embedding(x_temporal).unsqueeze(1)
+
+        # 2. 拼接成序列 [B, 3, D]
+        tokens = torch.cat([t, f, temp], dim=1)
+        tokens = tokens + self.pos_embedding
+
+        # 3. Transformer Encoder
+        encoded = self.transformer(tokens)  # [B, 3, D]
+
+        # 4. Mean Pooling
+        pooled = encoded.mean(dim=1)        # [B, D]
+
+        # 5. 回归
+        output = self.regressor(pooled)     # [B, 1]
         return output
 
     def predict_with_uncertainty(self, x_time, x_fourier, x_temporal, num_samples=100):
-        """MC Dropout估计预测不确定性"""
         self.train()
-        predictions = []
+        preds = []
         with torch.no_grad():
             for _ in range(num_samples):
-                pred = self.forward(x_time, x_fourier, x_temporal)
-                predictions.append(pred.cpu().numpy())
+                p = self.forward(x_time, x_fourier, x_temporal)
+                preds.append(p.cpu().numpy())
         self.eval()
-        predictions = np.concatenate(predictions, axis=1)
-        return np.mean(predictions, axis=1, keepdims=True), np.std(predictions, axis=1, keepdims=True)
+        preds = np.concatenate(preds, axis=1)
+        return preds.mean(axis=1, keepdims=True), preds.std(axis=1, keepdims=True)
